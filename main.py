@@ -1,3 +1,4 @@
+import json
 import os
 import requests
 from flask import Flask, jsonify, request
@@ -10,15 +11,33 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-# พอร์ตกลางสำหรับเก็บสถานะหุ้นที่เราซื้อจริง
-PORTFOLIO = {
-    "cash": 5000000.0,
-    "initial_capital": 5000000.0,
-    "max_risk_per_trade": 50000.0,
-    "positions": (
-        []
-    ),  # ตัวอย่าง structure: {"symbol": "PTT", "shares": 5000, "avg_cost": 34.0, "stop_loss": 32.5}
-}
+PORTFOLIO_FILE = "portfolio.json"
+
+
+def load_portfolio():
+  """โหลดข้อมูลพอร์ตจากไฟล์ JSON ถ้าไม่มีให้ใช้ค่าเริ่มต้น"""
+  if os.path.exists(PORTFOLIO_FILE):
+    try:
+      with open(PORTFOLIO_FILE, "r") as f:
+        return json.load(f)
+    except Exception:
+      pass
+  return {
+      "cash": 5000000.0,
+      "initial_capital": 5000000.0,
+      "max_risk_per_trade": 50000.0,
+      "positions": [],
+  }
+
+
+def save_portfolio(portfolio):
+  """บันทึกข้อมูลพอร์ตลงไฟล์ JSON"""
+  try:
+    with open(PORTFOLIO_FILE, "w") as f:
+      json.dump(portfolio, f, indent=4)
+  except Exception as e:
+    print(f"Error saving portfolio: {e}")
+
 
 WATCHLIST_UNIVERSE = [
     "PTT.BK",
@@ -78,12 +97,12 @@ def check_market_regime():
 
 @app.route("/")
 def home():
-  return "DPS V7.5 Portfolio Tracking Bot is running."
+  return "DPS V7.5 Persistent Portfolio Bot is running."
 
 
 @app.route("/buy", methods=["GET"])
 def simulate_buy():
-  """ลิงก์สำหรับจำลองการกดซื้อหุ้น เช่น /buy?symbol=PTT&shares=5000&price=34.0&sl=32.5"""
+  portfolio = load_portfolio()
   symbol = request.args.get("symbol", "").upper()
   shares = int(request.args.get("shares", 0))
   price = float(request.args.get("price", 0.0))
@@ -92,43 +111,44 @@ def simulate_buy():
   if not symbol or shares <= 0 or price <= 0:
     return jsonify({
         "status": "error",
-        "message": (
-            "Please provide ?symbol=XXX&shares=X&price=X&sl=X in URL"
-        ),
+        "message": "Use format: /buy?symbol=PTT&shares=5000&price=34.0&sl=32.5",
     })
 
   total_cost = shares * price
-  if total_cost > PORTFOLIO["cash"]:
+  if total_cost > portfolio["cash"]:
     return jsonify({"status": "error", "message": "Insufficient Cash Balance"})
 
-  PORTFOLIO["cash"] -= total_cost
-  PORTFOLIO["positions"].append({
+  portfolio["cash"] -= total_cost
+  portfolio["positions"].append({
       "symbol": symbol,
       "shares": shares,
       "avg_cost": price,
       "stop_loss": stop_loss,
   })
 
+  save_portfolio(portfolio)
+
   send_telegram_message(
-      f"🛒 *SIMULATED BUY EXECUTED*\n- Symbol: `{symbol}`\n- Shares:"
+      f"🛒 *SIMULATED BUY SAVED*\n- Symbol: `{symbol}`\n- Shares:"
       f" `{shares:,}` @ `{price}`\n- Stop Loss: `{stop_loss}`"
   )
-  return jsonify({"status": "success", "portfolio": PORTFOLIO})
+  return jsonify({"status": "success", "portfolio": portfolio})
 
 
 @app.route("/run-dps-scan", methods=["GET"])
 def run_dps_scan():
+  portfolio = load_portfolio()
   regime_text, is_safe_market = check_market_regime()
 
   report = "📊 *DPS V7.5 Portfolio & Market Monitor*\n\n"
   report += f"### A. Market Regime: `{regime_text}`\n\n"
 
-  # 1. ติดตามสถานะหุ้นที่ถืออยู่ในพอร์ตปัจจุบัน (Portfolio Tracking)
+  # 1. ติดตามสถานะหุ้นในพอร์ต
   report += "### B. Active Positions (พอร์ตที่ถืออยู่ปัจจุบัน)\n"
-  total_market_value = PORTFOLIO["cash"]
+  total_market_value = portfolio["cash"]
 
-  if PORTFOLIO["positions"]:
-    for pos in PORTFOLIO["positions"]:
+  if portfolio["positions"]:
+    for pos in portfolio["positions"]:
       sym_bk = pos["symbol"] + ".BK"
       try:
         df_cur = yf.download(
@@ -147,7 +167,6 @@ def run_dps_scan():
       pnl = (curr_p - pos["avg_cost"]) * pos["shares"]
       pnl_pct = ((curr_p - pos["avg_cost"]) / pos["avg_cost"]) * 100
 
-      # เช็กว่าหลุด Stop Loss หรือยัง
       sl_warning = (
           " ⚠️ *[PRICE NEAR/BELOW STOP LOSS]*"
           if curr_p <= pos["stop_loss"]
@@ -163,21 +182,22 @@ def run_dps_scan():
   else:
     report += "• *พอร์ตว่าง 100%* (รอจังหวะ High-Conviction)\n\n"
 
-  total_pnl = total_market_value - PORTFOLIO["initial_capital"]
-  total_pnl_pct = (total_pnl / PORTFOLIO["initial_capital"]) * 100
+  total_pnl = total_market_value - portfolio["initial_capital"]
+  total_pnl_pct = (total_pnl / portfolio["initial_capital"]) * 100
   report += f"💰 **Total Portfolio Value:** `{total_market_value:,.2f} THB`\n"
   report += (
       f"📈 **Total PnL:** `{total_pnl:+,.2f} THB` (`{total_pnl_pct:+.2f}%`)\n"
-      f"- Cash: `{PORTFOLIO['cash']:,.2f} THB`\n\n"
+      f"- Cash: `{portfolio['cash']:,.2f} THB`\n\n"
   )
 
-  # 2. สแกนหาหุ้นใหม่เฉพาะกรณีพอร์ตยังไม่เต็ม (ไม่เกิน 3 ตัว)
-  if is_safe_market and len(PORTFOLIO["positions"]) < 3:
+  # 2. สแกนหาหุ้นใหม่
+  if is_safe_market and len(portfolio["positions"]) < 3:
     report += "### C. New Opportunities Scan\n"
     opportunities = []
     for ticker in WATCHLIST_UNIVERSE:
-      # ข้ามหุ้นที่มีในพอร์ตแล้ว
-      if ticker.replace(".BK", "") in [p["symbol"] for p in PORTFOLIO["positions"]]:
+      if ticker.replace(".BK", "") in [
+          p["symbol"] for p in portfolio["positions"]
+      ]:
         continue
       try:
         df = yf.download(ticker, period="6mo", interval="1d", progress=False)
@@ -226,7 +246,7 @@ def run_dps_scan():
             if risk_per_share <= 0:
               continue
             suggested_shares = int(
-                PORTFOLIO["max_risk_per_trade"] / risk_per_share
+                portfolio["max_risk_per_trade"] / risk_per_share
             )
             suggested_shares = round(suggested_shares, -2) // 100 * 100
             if suggested_shares < 100:
@@ -254,10 +274,10 @@ def run_dps_scan():
     else:
       report += "• ไม่มีหุ้นเข้าเกณฑ์เพิ่มเติมในรอบนี้\n"
   else:
-    report += "### C. New Opportunities Scan\n• พอร์ตเต็ม (ครบ 3 ตัว) หรือตลาดอยู่ในโหมดพักตัว งดรับเพิ่ม\n"
+    report += "### C. New Opportunities Scan\n• พอร์ตเต็มหรือตลาดอยู่ในโหมดพักตัว\n"
 
   send_telegram_message(report)
-  return jsonify({"status": "success", "portfolio": PORTFOLIO})
+  return jsonify({"status": "success", "portfolio": portfolio})
 
 
 if __name__ == "__main__":
